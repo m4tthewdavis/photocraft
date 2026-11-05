@@ -9,7 +9,7 @@ use photocraft_color::ColorMode;
 use photocraft_geom::Rect;
 
 use crate::Ctx;
-use crate::fxutil::{MAXC, box_blur_n, gauss_blur_n, rgba, set_rgba};
+use crate::fxutil::{MAXC, box_blur_n, gauss_blur_n, gauss_box_radii, rgba, set_rgba};
 use crate::image::Image;
 
 pub(crate) struct DenoiseSpec {
@@ -23,9 +23,29 @@ pub(crate) struct DenoiseSpec {
 const MAX_LUMA_R: usize = 5;
 const MAX_CHROMA_R: usize = 9;
 
-/// Pixels read beyond an output tile (two box passes per guided filter, plus sharpening).
-pub(crate) fn reach() -> f32 {
-    (2 * MAX_LUMA_R + 2 * MAX_CHROMA_R + 6) as f32
+/// Box radius of the luminance guided filter for Strength `strength` (0..10).
+fn luma_radius(strength: f32) -> usize {
+    ((1.0 + strength.clamp(0.0, 10.0) * 0.4).round() as usize).min(MAX_LUMA_R)
+}
+
+/// Box radius of the chroma guided filter for Reduce Color Noise `col` (0..1).
+fn chroma_radius(col: f32) -> usize {
+    ((1.0 + col * 8.0).round() as usize).min(MAX_CHROMA_R)
+}
+
+/// Pixels read beyond an output tile with these settings: the JPEG deblock's 3 × 3 average,
+/// two box passes per guided filter (chroma is guided by the cleaned luma, so the two add up),
+/// and the sharpening blur, plus one pixel of slack. With the defaults this is about half the
+/// worst case, which is what the tile margin, and so most of the re-read work, scales with.
+pub(crate) fn reach(spec: &DenoiseSpec) -> f32 {
+    let s = spec.strength.clamp(0.0, 10.0) / 10.0;
+    let col = spec.color.clamp(0.0, 100.0) / 100.0;
+    let sh = spec.sharpen.clamp(0.0, 100.0) / 100.0;
+    let jpeg = if spec.jpeg { 1 } else { 0 };
+    let luma = if s > 0.0 { 2 * luma_radius(spec.strength) } else { 0 };
+    let chroma = if col > 0.0 { 2 * chroma_radius(col) } else { 0 };
+    let sharpen = if sh > 0.0 { gauss_box_radii(1.0).iter().sum::<usize>() } else { 0 };
+    (jpeg + luma + chroma.max(sharpen) + 1) as f32
 }
 
 /// Shared first and second moments of a guide (two filtered channels).
@@ -110,10 +130,12 @@ pub(crate) fn reduce_noise(src: &Image, out: Rect, ctx: &Ctx, spec: &DenoiseSpec
     let mut c1 = vec![0.0f32; if model == Model::Gray { 0 } else { len }];
     let mut c2 = vec![0.0f32; if model == Model::Gray { 0 } else { len }];
     let mut px = [0.0f32; MAXC];
+    // The window is the image's own rectangle: its samples in order, as `get` would read them.
+    let mut samples = src.data.chunks_exact(n.max(1));
     for (i, yy) in yv.iter_mut().enumerate() {
-        let (x, y) = (win.x0 + (i % ww) as i32, win.y0 + (i / ww) as i32);
-        for (c, v) in px.iter_mut().enumerate().take(n) {
-            *v = src.get(x, y, c);
+        let Some(s) = samples.next() else { break };
+        for (v, &sv) in px.iter_mut().zip(s) {
+            *v = sv;
         }
         match model {
             Model::Gray => *yy = px[0],
@@ -151,10 +173,10 @@ pub(crate) fn reduce_noise(src: &Image, out: Rect, ctx: &Ctx, spec: &DenoiseSpec
     }
     // Luminance: edge-preserving smoothing; Preserve Details shrinks the regularisation.
     if s > 0.0 {
-        let r = (1.0 + spec.strength.clamp(0.0, 10.0) * 0.4).round() as usize;
+        let r = luma_radius(spec.strength);
         let keep = spec.preserve.clamp(0.0, 100.0) / 100.0;
         let eps = (0.004 + 0.05 * s).powi(2) * (1.05 - keep);
-        let d = guided_luma(&yv, ww, wh, r.min(MAX_LUMA_R), eps);
+        let d = guided_luma(&yv, ww, wh, r, eps);
         let k = s.sqrt();
         for (v, dv) in yv.iter_mut().zip(d) {
             *v += (dv - *v) * k;
@@ -162,11 +184,10 @@ pub(crate) fn reduce_noise(src: &Image, out: Rect, ctx: &Ctx, spec: &DenoiseSpec
     }
     // Chroma: guided by the cleaned luma so colour edges stay put.
     if col > 0.0 && model != Model::Gray {
-        let r = (1.0 + col * 8.0).round() as usize;
         let eps = (0.01 + 0.05 * col).powi(2);
-        guided_chroma(&yv, [&mut c1, &mut c2], ww, wh, r.min(MAX_CHROMA_R), eps, col);
+        guided_chroma(&yv, [&mut c1, &mut c2], ww, wh, chroma_radius(col), eps, col);
     }
-    // Sharpen Details: unsharp mask on luma.
+    // Sharpen Details: unsharp mask on luma (`reach` counts this blur's box radii).
     if sh > 0.0 {
         let mut bl = yv.clone();
         gauss_blur_n(&mut bl, ww, wh, 1, 1.0);

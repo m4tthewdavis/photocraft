@@ -109,47 +109,248 @@ pub(crate) fn unpremul_px(px: &mut [f32], alpha: bool) {
     }
 }
 
+/// The value an `f64` iterator `sum()` starts from. The running sums below fold their first
+/// window by hand, starting here, so they keep the exact bits (signed zeros included) of the
+/// `sum()` they replace.
+#[inline]
+fn f64_sum_start() -> f64 {
+    std::iter::empty::<f64>().sum()
+}
+
 /// In-place running-sum box blur of every row of a `w × h × n` interleaved
 /// buffer with radius `r` (edges clamped). `scratch` must hold `w × n`.
+///
+/// Per channel the arithmetic is the original's, in its order (first window summed left to right
+/// in `f64`, then `acc += add − sub`), so results are bit-for-bit those of
+/// [`reference::box_rows_n`]; only the clamped reads are confined to the row ends.
 fn box_rows_n(buf: &mut [f32], w: usize, n: usize, r: usize, scratch: &mut Vec<f32>) {
-    if r == 0 || w == 0 {
+    if r == 0 || w == 0 || n == 0 {
         return;
     }
     let norm = 1.0 / (2 * r + 1) as f64;
     for row in buf.chunks_exact_mut(w * n) {
         scratch.clear();
         scratch.extend_from_slice(row);
-        // f64 sums: rounding must not depend on where a window starts (tile independence).
-        let at = |x: isize, c: usize| scratch[(x.clamp(0, w as isize - 1) as usize) * n + c] as f64;
-        for c in 0..n {
-            let mut acc: f64 = (-(r as isize)..=r as isize).map(|x| at(x, c)).sum();
-            for x in 0..w {
-                row[x * n + c] = (acc * norm) as f32;
-                acc += at(x as isize + r as isize + 1, c) - at(x as isize - r as isize, c);
+        // Fixed channel counts unroll the per-pixel channel loop.
+        match n {
+            1 => box_row::<1>(row, scratch, r, norm),
+            2 => box_row::<2>(row, scratch, r, norm),
+            3 => box_row::<3>(row, scratch, r, norm),
+            4 => box_row::<4>(row, scratch, r, norm),
+            _ => box_row_dyn(row, scratch, n, r, norm),
+        }
+    }
+}
+
+/// One row of [`box_rows_n`] for `N` channels: `src` is the row's original pixels.
+fn box_row<const N: usize>(row: &mut [f32], src: &[f32], r: usize, norm: f64) {
+    let px = src.as_chunks::<N>().0;
+    let out = row.as_chunks_mut::<N>().0;
+    let Some(last) = px.len().checked_sub(1) else { return };
+    let mut acc = [f64_sum_start(); N];
+    for x in -(r as isize)..=r as isize {
+        let Some(p) = px.get(x.clamp(0, last as isize) as usize) else { return };
+        for (a, &v) in acc.iter_mut().zip(p) {
+            *a += v as f64;
+        }
+    }
+    // Output x, then slide: add column x + r + 1, drop column x − r (both clamped).
+    for (x, o) in out.iter_mut().enumerate() {
+        let (Some(add), Some(sub)) = (px.get((x + r + 1).min(last)), px.get(x.saturating_sub(r))) else { return };
+        for c in 0..N {
+            o[c] = (acc[c] * norm) as f32;
+            acc[c] += add[c] as f64 - sub[c] as f64;
+        }
+    }
+}
+
+/// [`box_row`] for any channel count.
+fn box_row_dyn(row: &mut [f32], src: &[f32], n: usize, r: usize, norm: f64) {
+    let w = src.len() / n;
+    let Some(last) = w.checked_sub(1) else { return };
+    let at = |x: usize, c: usize| src.get(x * n + c).copied().unwrap_or(0.0) as f64;
+    let mut acc = vec![0.0f64; n];
+    for (c, a) in acc.iter_mut().enumerate() {
+        let mut sum = f64_sum_start();
+        for x in -(r as isize)..=r as isize {
+            sum += at(x.clamp(0, last as isize) as usize, c);
+        }
+        *a = sum;
+    }
+    for x in 0..w {
+        let add = (x + r + 1).min(last);
+        let sub = x.saturating_sub(r);
+        let Some(out) = row.get_mut(x * n..(x + 1) * n) else { return };
+        for (c, (o, a)) in out.iter_mut().zip(acc.iter_mut()).enumerate() {
+            *o = (*a * norm) as f32;
+            *a += at(add, c) - at(sub, c);
+        }
+    }
+}
+
+/// Same as [`box_rows_n`] over columns.
+///
+/// Walks the buffer a row at a time with one running sum per column and channel (sequential
+/// memory access; the old per-column gather walked it with a stride of a row). The original rows
+/// still to be subtracted are kept in a ring of `min(r + 1, h)` rows, so the extra memory is
+/// bounded by the radius, not the image. Each column's arithmetic is unchanged, so results are
+/// bit-for-bit those of [`reference::box_cols_n`].
+fn box_cols_n(buf: &mut [f32], w: usize, h: usize, n: usize, r: usize, scratch: &mut Vec<f32>) {
+    if r == 0 || h == 0 || w == 0 || n == 0 {
+        return;
+    }
+    let stride = w * n;
+    let Some(len) = stride.checked_mul(h) else { return };
+    if buf.len() < len {
+        return;
+    }
+    let norm = 1.0 / (2 * r + 1) as f64;
+    let last = h - 1;
+    // First window, summed top to bottom per column, as the original did.
+    let mut acc = vec![f64_sum_start(); stride];
+    for y in -(r as isize)..=r as isize {
+        let yy = y.clamp(0, last as isize) as usize;
+        let Some(src) = buf.get(yy * stride..(yy + 1) * stride) else { return };
+        for (a, &v) in acc.iter_mut().zip(src) {
+            *a += v as f64;
+        }
+    }
+    // Ring of original rows: row k lives in slot k % rows while it can still be subtracted.
+    let rows = (r + 1).min(h);
+    scratch.clear();
+    scratch.resize(rows * stride, 0.0);
+    for y in 0..h {
+        let slot = (y % rows) * stride;
+        let (Some(keep), Some(row)) = (scratch.get_mut(slot..slot + stride), buf.get(y * stride..(y + 1) * stride)) else { return };
+        keep.copy_from_slice(row);
+        let add = (y + r + 1).min(last);
+        let sub = y.saturating_sub(r);
+        // `sub` ≤ y is always in the ring; `add` ≥ y is untouched in `buf` unless it is row y
+        // itself (the last rows, clamped), which was just saved.
+        let s0 = (sub % rows) * stride;
+        let Some(sub_row) = scratch.get(s0..s0 + stride) else { return };
+        let (head, tail) = buf.split_at_mut((y + 1) * stride);
+        let Some(out) = head.get_mut(y * stride..) else { return };
+        if add > y {
+            let off = (add - y - 1) * stride;
+            let Some(add_row) = tail.get(off..off + stride) else { return };
+            for (((o, a), &av), &sv) in out.iter_mut().zip(acc.iter_mut()).zip(add_row).zip(sub_row) {
+                *o = (*a * norm) as f32;
+                *a += av as f64 - sv as f64;
+            }
+        } else {
+            // add == y: its original is in the ring (the slot just written).
+            let Some(add_row) = scratch.get(slot..slot + stride) else { return };
+            for (((o, a), &av), &sv) in out.iter_mut().zip(acc.iter_mut()).zip(add_row).zip(sub_row) {
+                *o = (*a * norm) as f32;
+                *a += av as f64 - sv as f64;
             }
         }
     }
 }
 
-/// Same as [`box_rows_n`] over columns (no transpose; walks with a stride).
-fn box_cols_n(buf: &mut [f32], w: usize, h: usize, n: usize, r: usize, scratch: &mut Vec<f32>) {
-    if r == 0 || h == 0 {
-        return;
-    }
-    let norm = 1.0 / (2 * r + 1) as f64;
-    for x in 0..w {
-        scratch.clear();
-        for y in 0..h {
-            scratch.extend_from_slice(&buf[(y * w + x) * n..(y * w + x + 1) * n]);
+/// The straightforward running-sum passes [`box_rows_n`] and [`box_cols_n`] replaced, kept as
+/// the oracle their outputs must match bit for bit.
+#[cfg(test)]
+mod reference {
+    pub(super) fn box_rows_n(buf: &mut [f32], w: usize, n: usize, r: usize, scratch: &mut Vec<f32>) {
+        if r == 0 || w == 0 {
+            return;
         }
-        let at = |y: isize, c: usize| scratch[(y.clamp(0, h as isize - 1) as usize) * n + c] as f64;
-        for c in 0..n {
-            let mut acc: f64 = (-(r as isize)..=r as isize).map(|y| at(y, c)).sum();
-            for y in 0..h {
-                buf[(y * w + x) * n + c] = (acc * norm) as f32;
-                acc += at(y as isize + r as isize + 1, c) - at(y as isize - r as isize, c);
+        let norm = 1.0 / (2 * r + 1) as f64;
+        for row in buf.chunks_exact_mut(w * n) {
+            scratch.clear();
+            scratch.extend_from_slice(row);
+            let at = |x: isize, c: usize| scratch[(x.clamp(0, w as isize - 1) as usize) * n + c] as f64;
+            for c in 0..n {
+                let mut acc: f64 = (-(r as isize)..=r as isize).map(|x| at(x, c)).sum();
+                for x in 0..w {
+                    row[x * n + c] = (acc * norm) as f32;
+                    acc += at(x as isize + r as isize + 1, c) - at(x as isize - r as isize, c);
+                }
             }
         }
+    }
+
+    pub(super) fn box_cols_n(buf: &mut [f32], w: usize, h: usize, n: usize, r: usize, scratch: &mut Vec<f32>) {
+        if r == 0 || h == 0 {
+            return;
+        }
+        let norm = 1.0 / (2 * r + 1) as f64;
+        for x in 0..w {
+            scratch.clear();
+            for y in 0..h {
+                scratch.extend_from_slice(&buf[(y * w + x) * n..(y * w + x + 1) * n]);
+            }
+            let at = |y: isize, c: usize| scratch[(y.clamp(0, h as isize - 1) as usize) * n + c] as f64;
+            for c in 0..n {
+                let mut acc: f64 = (-(r as isize)..=r as isize).map(|y| at(y, c)).sum();
+                for y in 0..h {
+                    buf[(y * w + x) * n + c] = (acc * norm) as f32;
+                    acc += at(y as isize + r as isize + 1, c) - at(y as isize - r as isize, c);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod box_tests {
+    use super::{box_cols_n, box_rows_n, reference};
+
+    fn data(len: usize, seed: u32) -> Vec<f32> {
+        let mut x = seed.wrapping_mul(0x9E37_79B9) | 1;
+        (0..len)
+            .map(|i| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                match i % 11 {
+                    // Signed zeros, a large value and exact ties among the noise.
+                    0 => -0.0,
+                    1 => 0.0,
+                    2 => 1.0e6,
+                    _ => (x >> 8) as f32 / 16_777_216.0 * 2.0 - 0.5,
+                }
+            })
+            .collect()
+    }
+
+    fn same_bits(a: &[f32], b: &[f32], what: &str) {
+        assert_eq!(a.len(), b.len(), "{what}");
+        for (i, (x, y)) in a.iter().zip(b).enumerate() {
+            assert_eq!(x.to_bits(), y.to_bits(), "{what}: element {i}: {x} vs {y}");
+        }
+    }
+
+    #[test]
+    fn passes_match_the_reference_bit_for_bit() {
+        let mut seed = 1;
+        for (w, h) in [(1, 1), (1, 9), (9, 1), (2, 3), (7, 5), (33, 17), (64, 40)] {
+            for n in [1, 2, 3, 4, 5] {
+                for r in [1, 2, 3, 6, 16, 40, 100] {
+                    seed += 1;
+                    let src = data(w * h * n, seed);
+                    let (mut a, mut b) = (src.clone(), src.clone());
+                    let (mut sa, mut sb) = (Vec::new(), Vec::new());
+                    box_rows_n(&mut a, w, n, r, &mut sa);
+                    reference::box_rows_n(&mut b, w, n, r, &mut sb);
+                    same_bits(&a, &b, &format!("rows {w}x{h} n{n} r{r}"));
+                    let (mut a, mut b) = (src.clone(), src);
+                    box_cols_n(&mut a, w, h, n, r, &mut sa);
+                    reference::box_cols_n(&mut b, w, h, n, r, &mut sb);
+                    same_bits(&a, &b, &format!("cols {w}x{h} n{n} r{r}"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_short_buffer_is_left_alone() {
+        let mut buf = vec![0.25f32; 10];
+        let before = buf.clone();
+        box_cols_n(&mut buf, 4, 4, 1, 1, &mut Vec::new());
+        assert_eq!(buf, before);
     }
 }
 

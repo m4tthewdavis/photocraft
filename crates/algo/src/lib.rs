@@ -726,7 +726,15 @@ fn halo_ext(p: &FilterParams) -> Halo {
         FilterParams::LightingEffects { .. } => r(1.0),
         FilterParams::Relight { intensity, .. } if *intensity == 0.0 => Halo::Radius(0),
         FilterParams::Relight { .. } => Halo::Radius(relight::halo_radius_max()),
-        FilterParams::ReduceNoise { .. } => r(denoise::reach()),
+        FilterParams::ReduceNoise { strength, preserve_details, reduce_color_noise, sharpen_details, remove_jpeg_artifact } => {
+            r(denoise::reach(&denoise::DenoiseSpec {
+                strength: *strength,
+                preserve: *preserve_details,
+                color: *reduce_color_noise,
+                sharpen: *sharpen_details,
+                jpeg: *remove_jpeg_artifact,
+            }))
+        }
         // The kernels clamp the radius to 100 px: size the source window by what they use.
         FilterParams::SmartBlur { radius, .. } => r(radius.min(100.0)),
         FilterParams::LensBlur { radius, .. } => r(radius.min(100.0)),

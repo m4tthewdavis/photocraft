@@ -828,3 +828,34 @@ fn cancelled_filters_return_none_and_progress_never_regresses() {
     assert!(calls.load(Ordering::Relaxed) >= 1);
     assert_eq!(out.read_region(R), apply_tiled(&s, &p, area, R, None, 16, Some(R)).read_region(R));
 }
+
+/// Reduce Noise sizes its tile margin from its settings: tiny tiles (most pixels near a margin)
+/// must paint what one big tile paints for every combination, the worst case included, so the
+/// margin never falls short of what the filter reads.
+#[test]
+fn reduce_noise_margin_covers_what_its_settings_read() {
+    let r = Rect::new(0, 0, 96, 72);
+    for depth in [SampleType::U8, SampleType::F32] {
+        let s = pattern(depth, r);
+        for (strength, color, sharpen, jpeg) in [
+            (6.0, 45.0, 25.0, false),
+            (10.0, 100.0, 100.0, true),
+            (10.0, 0.0, 0.0, false),
+            (0.0, 100.0, 0.0, false),
+            (0.0, 0.0, 100.0, true),
+            (1.0, 5.0, 0.0, true),
+            (3.0, 60.0, 50.0, false),
+        ] {
+            let p =
+                FilterParams::ReduceNoise { strength, preserve_details: 40.0, reduce_color_noise: color, sharpen_details: sharpen, remove_jpeg_artifact: jpeg };
+            let area = output_area(&p, s.content_bounds(), r, None);
+            let one = apply_tiled(&s, &p, area, r, None, 4096, None).read_region(area);
+            for tile in [5, 13] {
+                let tiled = apply_tiled(&s, &p, area, r, None, tile, None).read_region(area);
+                let d = max_diff(&one, &tiled);
+                let limit = if depth == SampleType::U8 { 1.5 / 255.0 } else { 1.0e-4 };
+                assert!(d <= limit, "{depth:?} s{strength} c{color} sh{sharpen} jpeg {jpeg}: tile {tile} differs by {d}");
+            }
+        }
+    }
+}

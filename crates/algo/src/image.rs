@@ -162,12 +162,24 @@ impl Image {
 
     /// Copy of the samples inside `out` (for identity passes).
     pub fn crop(&self, out: Rect) -> Vec<f32> {
-        let mut v = Vec::with_capacity(out.width() as usize * out.height() as usize * self.ch);
-        for y in out.y0..out.y1 {
-            for x in out.x0..out.x1 {
-                for c in 0..self.ch {
-                    v.push(self.get(x, y, c));
-                }
+        let n = self.ch;
+        let len = out.width() as usize * out.height() as usize * n;
+        let mut v = vec![0.0f32; len];
+        if n == 0 || len == 0 {
+            return v;
+        }
+        // Copy the part of each row inside the image; the rest stays 0, as `get` reads it.
+        let inside = out.intersect(&self.rect);
+        if inside.is_empty() {
+            return v;
+        }
+        let ow = out.width() as usize * n;
+        let (lead, span) = ((inside.x0 - out.x0) as usize * n, inside.width() as usize * n);
+        for y in inside.y0..inside.y1 {
+            let d = (y - out.y0) as usize * ow + lead;
+            let s = self.index(inside.x0, y);
+            if let (Some(dst), Some(src)) = (v.get_mut(d..d + span), self.data.get(s..s + span)) {
+                dst.copy_from_slice(src);
             }
         }
         v
@@ -196,6 +208,36 @@ pub fn unpremultiply(data: &mut [f32], ch: usize, alpha: bool) {
         let a = px[ch - 1];
         for v in px.iter_mut().take(ch - 1) {
             *v = if a > 1e-7 { *v / a } else { 0.0 };
+        }
+    }
+}
+
+#[cfg(test)]
+mod crop_tests {
+    use super::Image;
+    use photocraft_geom::Rect;
+
+    /// `crop` copies row spans; it must read exactly what sample-by-sample `get` reads, zeros
+    /// outside the image included.
+    #[test]
+    fn crop_matches_get_inside_overlapping_and_outside() {
+        for ch in [1usize, 3, 4] {
+            let rect = Rect::new(-3, 5, 17, 19);
+            let mut img = Image::new(rect, ch);
+            for (i, v) in img.data.iter_mut().enumerate() {
+                *v = i as f32 * 0.5 + 1.0;
+            }
+            for out in [rect, Rect::new(0, 8, 9, 12), Rect::new(-10, 0, 30, 25), Rect::new(10, 15, 40, 40), Rect::new(50, 50, 60, 52), Rect::new(2, 6, 2, 9)] {
+                let mut want = Vec::new();
+                for y in out.y0..out.y1 {
+                    for x in out.x0..out.x1 {
+                        for c in 0..ch {
+                            want.push(img.get(x, y, c));
+                        }
+                    }
+                }
+                assert_eq!(img.crop(out), want, "ch {ch} out {out:?}");
+            }
         }
     }
 }
