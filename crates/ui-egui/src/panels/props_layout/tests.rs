@@ -119,6 +119,12 @@ fn pixel_layer_shows_remove_background_quick_action() {
 }
 
 #[test]
+fn pixel_layer_lists_build_up_layers_quick_action() {
+    let ids: Vec<&str> = quick_actions(&LayerContent::Raster(Default::default())).iter().map(|(_, id)| *id).collect();
+    assert!(ids.contains(&"layer.buildUpLayers"), "{ids:?}");
+}
+
+#[test]
 fn other_kinds_use_the_same_headers() {
     let (s, layers) = kinds();
     let mut h = harness(s, 1.0, 320.0);
