@@ -120,7 +120,9 @@ fn pixel_layer_shows_remove_background_quick_action() {
 
 #[test]
 fn pixel_layer_lists_build_up_layers_quick_action() {
-    let ids: Vec<&str> = quick_actions(&LayerContent::Raster(Default::default())).iter().map(|(_, id)| *id).collect();
+    let fmt = photocraft_color::PixelFormat::new(photocraft_color::ColorMode::Rgb, photocraft_color::SampleType::U8, true);
+    let layer = Layer::raster("Pixels".to_string(), fmt);
+    let ids: Vec<&str> = quick_actions(&layer.content).iter().map(|(_, id)| *id).collect();
     assert!(ids.contains(&"layer.buildUpLayers"), "{ids:?}");
 }
 
